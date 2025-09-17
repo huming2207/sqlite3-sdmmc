@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <sys/time.h>
 #include <esp_random.h>
+#include "esp_heap_caps.h"
 
 /* ESP-IDF and FreeRTOS headers */
 #include "sdmmc_cmd.h"
@@ -80,12 +81,12 @@ static int esp_sqlite_sdmmc_shm_unmap(sqlite3_file*, int delete_flag);
 static int esp_sqlite_sdmmc_open(sqlite3_vfs*, const char *, sqlite3_file*, int , int *);
 static int esp_sqlite_sdmmc_delete(sqlite3_vfs*, const char *z_name, int sync_dir);
 static int esp_sqlite_sdmmc_access(sqlite3_vfs*, const char *z_name, int flags, int *);
-static int esp_sqlite_sdmmc_full_pathname(sqlite3_vfs*, const char *z_name, int n_out,char *z_out);
-static void *esp_sqlite_sdmmc_dl_open(sqlite3_vfs*, const char *z_filename);
+static int esp_sqlite_sdmmc_full_pathname(sqlite3_vfs*, const char *z_path, int n_out,char *z_out);
+static void *esp_sqlite_sdmmc_dl_open(sqlite3_vfs*, const char *z_path);
 static void esp_sqlite_sdmmc_dl_error(sqlite3_vfs*, int n_byte, char *z_err_msg);
 static void (*esp_sqlite_sdmmc_dl_sym(sqlite3_vfs*,void*, const char *z_symbol))(void);
 static void esp_sqlite_sdmmc_dl_close(sqlite3_vfs*, void*);
-static int esp_sqlite_sdmmc_randomness(sqlite3_vfs*, int n_byte, char *z_out);
+static int esp_sqlite_sdmmc_randomness(sqlite3_vfs*, int n_byte, char *z_buf_out);
 static int esp_sqlite_sdmmc_sleep(sqlite3_vfs*, int microseconds);
 static int esp_sqlite_sdmmc_current_time(sqlite3_vfs*, double*);
 static int esp_sqlite_sdmmc_get_last_error(sqlite3_vfs*, int, char*);
@@ -111,7 +112,10 @@ static sqlite3_vfs esp_sqlite_sdmmc_vfs = {
   esp_sqlite_sdmmc_sleep,                    /* xSleep */
   esp_sqlite_sdmmc_current_time,             /* xCurrentTime */
   esp_sqlite_sdmmc_get_last_error,           /* xGetLastError */
-  esp_sqlite_sdmmc_current_time_int64        /* xCurrentTimeInt64 */
+  esp_sqlite_sdmmc_current_time_int64,        /* xCurrentTimeInt64 */
+  NULL,
+  NULL,
+  NULL,
 };
 
 /* I/O methods for block device files */
@@ -132,11 +136,66 @@ static const sqlite3_io_methods esp_sqlite_sdmmc_io_methods = {
   esp_sqlite_sdmmc_shm_map,
   esp_sqlite_sdmmc_shm_lock,
   esp_sqlite_sdmmc_shm_barrier,
-  esp_sqlite_sdmmc_shm_unmap
+  esp_sqlite_sdmmc_shm_unmap,
+  NULL, // iVersion 2 doesn't need these
+  NULL,
 };
 
 #define MIN(x,y) ((x)<(y)?(x):(y))
 #define MAX(x,y) ((x)>(y)?(x):(y))
+
+/******************************************************************************
+** Memory Allocation Routines
+******************************************************************************/
+
+// Wrapper for malloc
+static void *sqlite3_psram_malloc(int n) {
+    return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_32BIT);
+}
+
+// Wrapper for free
+static void sqlite3_psram_free(void *p) {
+    heap_caps_free(p);
+}
+
+// Wrapper for realloc
+static void *sqlite3_psram_realloc(void *p, int n) {
+    return heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_32BIT);
+}
+
+// Wrapper for size.
+static int sqlite3_psram_size(void *p) {
+    if (p == NULL) return 0;
+    return heap_caps_get_allocated_size(p);
+}
+
+// Wrapper for roundup
+static int sqlite3_psram_roundup(int n) {
+    // Round up to nearest multiple of 4, since malloc is 4-byte aligned
+    // This might not be necessary.
+    return (n + 3) & ~3;
+}
+
+// Init and Shutdown
+static int sqlite3_psram_init(void *pAppData) {
+    return SQLITE_OK;
+}
+
+static void sqlite3_psram_shutdown(void *pAppData) {
+    // No-op
+}
+
+static const sqlite3_mem_methods sqlite3_psram_mem_methods = {
+    sqlite3_psram_malloc,
+    sqlite3_psram_free,
+    sqlite3_psram_realloc,
+    sqlite3_psram_size,
+    sqlite3_psram_roundup,
+    sqlite3_psram_init,
+    sqlite3_psram_shutdown,
+    NULL // pAppData
+};
+
 
 /******************************************************************************
 ** Block Device File I/O
@@ -457,6 +516,8 @@ static int esp_sqlite_sdmmc_current_time_int64(sqlite3_vfs *p_vfs, sqlite3_int64
 ** Register the VFS with SQLite.
 */
 int sqlite3_esp_sqlite_sdmmc_vfs_register(sdmmc_card_t *p_card, int make_default){
+  sqlite3_config(SQLITE_CONFIG_MALLOC, &sqlite3_psram_mem_methods);
+
   if (!p_card) return SQLITE_MISUSE;
   esp_sqlite_sdmmc_vfs.pAppData = p_card;
   return sqlite3_vfs_register(&esp_sqlite_sdmmc_vfs, make_default);

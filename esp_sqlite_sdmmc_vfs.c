@@ -104,13 +104,13 @@
 #define FS_VFS_NAME "sdmmc"
 
 static struct {
-  int nDatabase;       /* Current size of database region */
-  int nJournal;        /* Current size of journal region */
-  uint32_t nBlob;           /* Total size of allocated blob */
-  int nRef;            /* Number of open file handles */
-  const char *zName;   /* Name of database file */
+  int64_t nDatabase;     /* Current size of database region */
+  int64_t nJournal;      /* Current size of journal region */
+  int64_t nBlob;         /* Total size of allocated blob */
+  int nRef;              /* Number of open file handles */
+  const char *zName;     /* Name of database file */
   sdmmc_card_t *pCard;
-  int open;            /* True if database file is open */
+  int open;              /* True if database file is open */
 } shared_file;
 
 static sdmmc_card_t *pCard_global = NULL;
@@ -498,7 +498,7 @@ static int fsWrite(
     if (rc == ESP_OK) {
       shared_file.nDatabase = (int) MAX(shared_file.nDatabase, iAmt+iOfst);
     }
-  } else {
+  } else if (p->eType == JOURNAL_FILE) {
     uint32_t start_sector = (shared_file.nBlob - iOfst - iAmt) / shared_file.pCard->csd.sector_size;
     if ((start_sector * shared_file.pCard->csd.sector_size) < (shared_file.nDatabase + BLOCKSIZE)) {
         return SQLITE_FULL;

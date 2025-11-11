@@ -1,0 +1,8 @@
+//
+// Created by Jackson Hu on 21/9/2025.
+//
+
+#ifndef SOULLOGGER_ESP_SQLITE_SDMMC_VFS_H
+#define SOULLOGGER_ESP_SQLITE_SDMMC_VFS_H
+
+#endif //SOULLOGGER_ESP_SQLITE_SDMMC_VFS_H

@@ -18,7 +18,7 @@
 #define SQLITE_DISABLE_FTS3_UNICODE          1
 #define SQLITE_DISABLE_FTS4_DEFERRED         1
 #define SQLITE_LIKE_DOESNT_MATCH_BLOBS       1
-#define SQLITE_DEFAULT_CACHE_SIZE           -1   // 1KB
+#define SQLITE_DEFAULT_CACHE_SIZE           -1024   // 1MB
 #define SQLITE_DEFAULT_FOREIGN_KEYS          0
 #define SQLITE_DEFAULT_MEMSTATUS             0
 #define SQLITE_DEFAULT_MMAP_SIZE             0
@@ -39,9 +39,9 @@
 #define SQLITE_OMIT_AUTOINIT                 1
 #define SQLITE_OMIT_AUTOMATIC_INDEX          1
 #define SQLITE_OMIT_AUTORESET                1
-#define SQLITE_OMIT_AUTOVACUUM               1
+#undef SQLITE_OMIT_AUTOVACUUM
 #undef SQLITE_OMIT_BETWEEN_OPTIMIZATION
-#define SQLITE_OMIT_BLOB_LITERAL 1
+#undef SQLITE_OMIT_BLOB_LITERAL
 #define SQLITE_OMIT_BTREECOUNT               1
 #define SQLITE_OMIT_BUILTIN_TEST             1
 #define SQLITE_OMIT_CAST                     1

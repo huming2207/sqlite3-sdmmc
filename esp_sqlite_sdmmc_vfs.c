@@ -869,7 +869,12 @@ int sqlite3_esp_sqlite_sdmmc_vfs_register(sdmmc_card_t *p_card, int make_default
       sqlite3_free(fs_vfs.base.pAppData);
   }
 
+#ifdef CONFIG_SPIRAM
+  sdmmc_vfs_data *p_data = heap_caps_malloc(sizeof(sdmmc_vfs_data), MALLOC_CAP_SPIRAM);
+#else
   sdmmc_vfs_data *p_data = malloc(sizeof(sdmmc_vfs_data));
+#endif
+
   if(!p_data) {
       fs_vfs.base.pAppData = NULL;
       return SQLITE_NOMEM;
@@ -887,8 +892,48 @@ int sqlite3_esp_sqlite_sdmmc_vfs_register(sdmmc_card_t *p_card, int make_default
 int SqlitetestOnefile_Init() { return fs_register(); }
 #endif
 
+static void *sqlite3_psram_malloc(int len)
+{
+  return heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+}
+
+static void *sqlite3_psram_realloc(void *ptr, int len)
+{
+  return heap_caps_realloc(ptr, len, MALLOC_CAP_SPIRAM);
+}
+
+static int sqlite3_psram_size(void *ptr)
+{
+  return heap_caps_get_allocated_size(ptr);
+}
+
+static int sqlite3_psram_roundup(int size)
+{
+  return size;
+}
+
+static int sqlite3_psram_init(void *ctx)
+{
+  return 0;
+}
+
+static void sqlite3_psram_deinit()
+{
+}
+
 int sqlite3_os_init()
 {
+  static sqlite3_mem_methods mem_methods = {
+    .xFree = free,
+    .xMalloc = sqlite3_psram_malloc,
+    .xRealloc = sqlite3_psram_realloc,
+    .xSize = sqlite3_psram_size,
+    .xRoundup = sqlite3_psram_roundup,
+    .xInit = sqlite3_psram_init,
+    .xShutdown = sqlite3_psram_deinit,
+  };
+
+  sqlite3_config(SQLITE_CONFIG_MALLOC, &mem_methods);
   return 0;
 }
 

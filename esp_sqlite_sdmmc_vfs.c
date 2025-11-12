@@ -103,23 +103,22 @@
 */
 #define FS_VFS_NAME "sdmmc"
 
-static struct {
-  int64_t nDatabase;     /* Current size of database region */
-  int64_t nJournal;      /* Current size of journal region */
-  int64_t nBlob;         /* Total size of allocated blob */
-  int nRef;              /* Number of open file handles */
-  const char *zName;     /* Name of database file */
-  sdmmc_card_t *pCard;
-  int open;              /* True if database file is open */
-} shared_file;
-
-static sdmmc_card_t *pCard_global = NULL;
+typedef struct sdmmc_vfs_data {
+    int64_t nDatabase;     /* Current size of database region */
+    int64_t nJournal;      /* Current size of journal region */
+    int64_t nBlob;         /* Total size of allocated blob */
+    int nRef;              /* Number of open file handles */
+    const char *zName;     /* Name of database file */
+    int open;              /* True if database file is open */
+    sdmmc_card_t *pCard;
+} sdmmc_vfs_data;
 
 typedef struct fs_file fs_file;
 
 struct fs_file
 {
   sqlite3_file base;
+  sqlite3_vfs *pVfs;
   int eType;
 };
 
@@ -428,9 +427,14 @@ static int tmpDeviceCharacteristics(sqlite3_file* pFile)
 */
 static int fsClose(sqlite3_file* pFile)
 {
-  shared_file.nRef--;
-  if (shared_file.nRef == 0) {
-    memset(&shared_file, 0, sizeof(shared_file));
+  fs_file* p = (fs_file*) pFile;
+  sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)p->pVfs->pAppData;
+  p_vfs_data->nRef--;
+  if (p_vfs_data->nRef == 0) {
+    p_vfs_data->open = 0;
+    p_vfs_data->zName = NULL;
+    p_vfs_data->nDatabase = 0;
+    p_vfs_data->nJournal = 0;
   }
   return SQLITE_OK;
 }
@@ -446,30 +450,69 @@ static int fsRead(
 )
 {
   fs_file* p = (fs_file *) pFile;
+  sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)p->pVfs->pAppData;
   esp_err_t rc = ESP_OK;
-  int nSectors = iAmt / shared_file.pCard->csd.sector_size;
+  int sector_size = p_vfs_data->pCard->csd.sector_size;
+  int64_t available_size;
+  int64_t read_offset_on_disk;
+
+  printf("fsRead - iAmt %d, iOfst %lld \r\n", iAmt, iOfst);
 
   if (p->eType == DATABASE_FILE) {
-    if ((iAmt + iOfst) > shared_file.nDatabase) {
-      memset(zBuf, 0, iAmt);
-      printf("Offset wrong - db\r\n");
-      return SQLITE_IOERR_SHORT_READ;
-    }
-    uint32_t start_sector = (iOfst + BLOCKSIZE) / shared_file.pCard->csd.sector_size;
-    rc = sdmmc_read_sectors(shared_file.pCard, zBuf, start_sector, nSectors);
+    available_size = p_vfs_data->nDatabase;
+  } else { // JOURNAL_FILE
+    available_size = p_vfs_data->nJournal;
+  }
+
+  if (iOfst >= available_size) {
+    memset(zBuf, 0, iAmt);
+    return SQLITE_IOERR_SHORT_READ;
+  }
+
+  int to_read = iAmt;
+  if (iOfst + to_read > available_size) {
+    to_read = available_size - iOfst;
+    memset((char*)zBuf + to_read, 0, iAmt - to_read);
+  }
+
+  if (to_read == 0) {
+      return iAmt > 0 ? SQLITE_IOERR_SHORT_READ : SQLITE_OK;
+  }
+
+  if (p->eType == DATABASE_FILE) {
+    read_offset_on_disk = BLOCKSIZE + iOfst;
+  } else { // JOURNAL_FILE
+    read_offset_on_disk = p_vfs_data->nBlob - iOfst - to_read;
+  }
+
+  uint32_t start_sector = read_offset_on_disk / sector_size;
+  int64_t end_byte_on_disk = read_offset_on_disk + to_read;
+  uint32_t end_sector = (end_byte_on_disk - 1) / sector_size;
+  uint32_t num_sectors = end_sector - start_sector + 1;
+
+  bool is_aligned = (read_offset_on_disk % sector_size == 0) && (to_read % sector_size == 0);
+
+  if (is_aligned) {
+    rc = sdmmc_read_sectors(p_vfs_data->pCard, zBuf, start_sector, num_sectors);
   } else {
-    if ((iAmt + iOfst) > shared_file.nJournal) {
-      memset(zBuf, 0, iAmt);
-      printf( "Offset wrong - journal\r\n");
-      return SQLITE_IOERR_SHORT_READ;
+    uint8_t* temp_buf = malloc(num_sectors * sector_size);
+    if (!temp_buf) {
+      return SQLITE_NOMEM;
     }
-    uint32_t start_sector = (shared_file.nBlob - iOfst - iAmt) / shared_file.pCard->csd.sector_size;
-    rc = sdmmc_read_sectors(shared_file.pCard, zBuf, start_sector, nSectors);
+    rc = sdmmc_read_sectors(p_vfs_data->pCard, temp_buf, start_sector, num_sectors);
+    if (rc == ESP_OK) {
+      uint32_t offset_in_buffer = read_offset_on_disk - (start_sector * sector_size);
+      memcpy(zBuf, temp_buf + offset_in_buffer, to_read);
+    }
+    free(temp_buf);
   }
 
   if (rc != ESP_OK) {
-    printf("Offset wrong\r\n");
     return SQLITE_IOERR_READ;
+  }
+
+  if (to_read < iAmt) {
+    return SQLITE_IOERR_SHORT_READ;
   }
 
   return SQLITE_OK;
@@ -486,31 +529,62 @@ static int fsWrite(
 )
 {
   fs_file* p = (fs_file *) pFile;
+  sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)p->pVfs->pAppData;
   esp_err_t rc = ESP_OK;
-  int nSectors = iAmt / shared_file.pCard->csd.sector_size;
+  int sector_size = p_vfs_data->pCard->csd.sector_size;
 
+  printf("fsWrite - iAmt %d, iOfst %lld \r\n", iAmt, iOfst);
+
+  int64_t start_byte_on_disk;
   if (p->eType == DATABASE_FILE) {
-    if ((iAmt + iOfst + BLOCKSIZE) > (shared_file.nBlob - shared_file.nJournal)) {
+    if ((iOfst + iAmt + BLOCKSIZE) > (p_vfs_data->nBlob - p_vfs_data->nJournal)) {
       return SQLITE_FULL;
     }
-    uint32_t start_sector = (iOfst + BLOCKSIZE) / shared_file.pCard->csd.sector_size;
-    rc = sdmmc_write_sectors(shared_file.pCard, zBuf, start_sector, nSectors);
-    if (rc == ESP_OK) {
-      shared_file.nDatabase = (int) MAX(shared_file.nDatabase, iAmt+iOfst);
-    }
-  } else if (p->eType == JOURNAL_FILE) {
-    uint32_t start_sector = (shared_file.nBlob - iOfst - iAmt) / shared_file.pCard->csd.sector_size;
-    if ((start_sector * shared_file.pCard->csd.sector_size) < (shared_file.nDatabase + BLOCKSIZE)) {
+    start_byte_on_disk = BLOCKSIZE + iOfst;
+  } else { // JOURNAL_FILE
+    start_byte_on_disk = p_vfs_data->nBlob - iOfst - iAmt;
+    if (start_byte_on_disk < (p_vfs_data->nDatabase + BLOCKSIZE)) {
         return SQLITE_FULL;
-    }
-    rc = sdmmc_write_sectors(shared_file.pCard, zBuf, start_sector, nSectors);
-    if (rc == ESP_OK) {
-      shared_file.nJournal = (int) MAX(shared_file.nJournal, iAmt+iOfst);
     }
   }
 
+  uint32_t start_sector = start_byte_on_disk / sector_size;
+  int64_t end_byte_on_disk = start_byte_on_disk + iAmt;
+  uint32_t end_sector = (end_byte_on_disk - 1) / sector_size;
+  uint32_t num_sectors = end_sector - start_sector + 1;
+
+  bool is_aligned = (start_byte_on_disk % sector_size == 0) && (iAmt % sector_size == 0);
+
+  if (is_aligned) {
+    rc = sdmmc_write_sectors(p_vfs_data->pCard, zBuf, start_sector, num_sectors);
+  } else {
+    uint8_t* temp_buf = malloc(num_sectors * sector_size);
+    if (!temp_buf) {
+      return SQLITE_NOMEM;
+    }
+
+    rc = sdmmc_read_sectors(p_vfs_data->pCard, temp_buf, start_sector, num_sectors);
+    if (rc != ESP_OK) {
+      free(temp_buf);
+      return SQLITE_IOERR_READ;
+    }
+
+    uint32_t offset_in_buffer = start_byte_on_disk - (start_sector * sector_size);
+    memcpy(temp_buf + offset_in_buffer, zBuf, iAmt);
+
+    rc = sdmmc_write_sectors(p_vfs_data->pCard, temp_buf, start_sector, num_sectors);
+    free(temp_buf);
+  }
+
+
   if (rc != ESP_OK) {
     return SQLITE_IOERR_WRITE;
+  }
+
+  if (p->eType == DATABASE_FILE) {
+    p_vfs_data->nDatabase = (int64_t) MAX(p_vfs_data->nDatabase, iAmt + iOfst);
+  } else { // JOURNAL_FILE
+    p_vfs_data->nJournal = (int64_t) MAX(p_vfs_data->nJournal, iAmt + iOfst);
   }
 
   return SQLITE_OK;
@@ -522,10 +596,11 @@ static int fsWrite(
 static int fsTruncate(sqlite3_file* pFile, sqlite3_int64 size)
 {
   fs_file* p = (fs_file *) pFile;
+  sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)p->pVfs->pAppData;
   if (p->eType == DATABASE_FILE) {
-    shared_file.nDatabase = (int) MIN(shared_file.nDatabase, size);
+    p_vfs_data->nDatabase = (int) MIN(p_vfs_data->nDatabase, size);
   } else {
-    shared_file.nJournal = (int) MIN(shared_file.nJournal, size);
+    p_vfs_data->nJournal = (int) MIN(p_vfs_data->nJournal, size);
   }
   return SQLITE_OK;
 }
@@ -536,15 +611,16 @@ static int fsTruncate(sqlite3_file* pFile, sqlite3_int64 size)
 static int fsSync(sqlite3_file* pFile, int flags)
 {
   fs_file* p = (fs_file *) pFile;
+  sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)p->pVfs->pAppData;
   esp_err_t rc = ESP_OK;
 
   if (p->eType == DATABASE_FILE) {
     uint8_t zSize[BLOCKSIZE] = {0};
-    zSize[0] = (shared_file.nDatabase & 0xFF000000) >> 24;
-    zSize[1] = (unsigned char) ((shared_file.nDatabase & 0x00FF0000) >> 16);
-    zSize[2] = (shared_file.nDatabase & 0x0000FF00) >> 8;
-    zSize[3] = (shared_file.nDatabase & 0x000000FF);
-    rc = sdmmc_write_sectors(shared_file.pCard, zSize, 0, 1);
+    zSize[0] = (p_vfs_data->nDatabase & 0xFF000000) >> 24;
+    zSize[1] = (unsigned char) ((p_vfs_data->nDatabase & 0x00FF0000) >> 16);
+    zSize[2] = (p_vfs_data->nDatabase & 0x0000FF00) >> 8;
+    zSize[3] = (p_vfs_data->nDatabase & 0x000000FF);
+    rc = sdmmc_write_sectors(p_vfs_data->pCard, zSize, 0, 1);
   }
 
   if (rc != ESP_OK) {
@@ -560,10 +636,11 @@ static int fsSync(sqlite3_file* pFile, int flags)
 static int fsFileSize(sqlite3_file* pFile, sqlite3_int64* pSize)
 {
   fs_file* p = (fs_file *) pFile;
+  sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)p->pVfs->pAppData;
   if (p->eType == DATABASE_FILE) {
-    *pSize = shared_file.nDatabase;
+    *pSize = p_vfs_data->nDatabase;
   } else {
-    *pSize = shared_file.nJournal;
+    *pSize = p_vfs_data->nJournal;
   }
   return SQLITE_OK;
 }
@@ -615,7 +692,7 @@ static int fsSectorSize(sqlite3_file* pFile)
 */
 static int fsDeviceCharacteristics(sqlite3_file* pFile)
 {
-  return 0;
+  return SQLITE_IOCAP_ATOMIC512 | SQLITE_IOCAP_SEQUENTIAL;
 }
 
 /*
@@ -630,6 +707,7 @@ static int fsOpen(
 )
 {
   fs_file* p = (fs_file *) pFile;
+  sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)pVfs->pAppData;
   int eType;
   esp_err_t rc = ESP_OK;
 
@@ -641,48 +719,53 @@ static int fsOpen(
   }
 
   eType = ((flags & SQLITE_OPEN_MAIN_DB)) ? DATABASE_FILE : JOURNAL_FILE;
+  p->pVfs = pVfs;
+  p->eType = eType;
 
   if (eType == DATABASE_FILE) {
-    if (shared_file.open) {
-      if (strcmp(shared_file.zName, zName) != 0) {
+    if (p_vfs_data->open) {
+      if (strcmp(p_vfs_data->zName, zName) != 0) {
         return SQLITE_BUSY;
       }
     } else {
-      memset(&shared_file, 0, sizeof(shared_file));
-      shared_file.pCard = pCard_global;
-      shared_file.nBlob = (int64_t)pCard_global->csd.capacity * pCard_global->csd.sector_size;
-      shared_file.zName = zName;
+      p_vfs_data->nBlob = (int64_t)p_vfs_data->pCard->csd.capacity * p_vfs_data->pCard->csd.sector_size;
+      p_vfs_data->zName = zName;
+      int sector_size = p_vfs_data->pCard->csd.sector_size;
 
       uint8_t block0[BLOCKSIZE] = {0};
-      rc = sdmmc_read_sectors(shared_file.pCard, block0, 0, 1);
+      rc = sdmmc_read_sectors(p_vfs_data->pCard, block0, 0, 1);
       if (rc != ESP_OK) {
         printf( "Read blk0 fail\r\n");
         return SQLITE_IOERR_READ;
       }
-      shared_file.nDatabase = (block0[0] << 24) + (block0[1] << 16) + (block0[2] << 8) + block0[3];
+      p_vfs_data->nDatabase = (block0[0] << 24) + (block0[1] << 16) + (block0[2] << 8) + block0[3];
 
-      uint8_t last_block[BLOCKSIZE] = {0};
-      rc = sdmmc_read_sectors(shared_file.pCard, last_block, (shared_file.nBlob / BLOCKSIZE) - 1, 1);
+      uint8_t* last_block = malloc(sector_size);
+      if (!last_block) {
+          return SQLITE_NOMEM;
+      }
+      rc = sdmmc_read_sectors(p_vfs_data->pCard, last_block, (p_vfs_data->nBlob / sector_size) - 1, 1);
       if (rc != ESP_OK) {
-        printf("Read last blk fail, nblob=%lu \r\n", shared_file.nBlob);
+        printf("Read last blk fail, nblob=%llu \r\n", p_vfs_data->nBlob);
+        free(last_block);
         return SQLITE_IOERR_READ;
       }
 
       if (last_block[0] || last_block[1] || last_block[2] || last_block[3]) {
-          shared_file.nJournal = shared_file.nBlob;
+          p_vfs_data->nJournal = p_vfs_data->nBlob;
       }
-      shared_file.open = 1;
+      free(last_block);
+      p_vfs_data->open = 1;
     }
-    shared_file.nRef++;
+    p_vfs_data->nRef++;
   } else {
-    if (!shared_file.open) {
+    if (!p_vfs_data->open) {
       return SQLITE_CANTOPEN;
     }
-    shared_file.nRef++;
+    p_vfs_data->nRef++;
   }
 
   p->base.pMethods = &fs_io_methods;
-  p->eType = eType;
   
   return SQLITE_OK;
 }
@@ -694,18 +777,20 @@ static int fsOpen(
 */
 static int fsDelete(sqlite3_vfs* pVfs, const char* zPath, int dirSync)
 {
+  sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)pVfs->pAppData;
   esp_err_t rc = ESP_OK;
   int nName = (int) strlen(zPath) - 8;
 
   assert(strlen("-journal")==8);
   assert(strcmp("-journal", &zPath[nName])==0);
 
-  if (shared_file.open && strncmp(shared_file.zName, zPath, nName) == 0) {
-    uint8_t block[BLOCKSIZE] = {0};
-    uint32_t sector = (shared_file.nBlob / BLOCKSIZE - 1);
-    rc = sdmmc_write_sectors(shared_file.pCard, block, sector, 1);
+  if (p_vfs_data->open && strncmp(p_vfs_data->zName, zPath, nName) == 0) {
+    uint8_t block[p_vfs_data->pCard->csd.sector_size];
+    memset(block, 0, sizeof(block));
+    uint32_t sector = (p_vfs_data->nBlob / p_vfs_data->pCard->csd.sector_size - 1);
+    rc = sdmmc_write_sectors(p_vfs_data->pCard, block, sector, 1);
     if (rc == ESP_OK) {
-      shared_file.nJournal = 0;
+      p_vfs_data->nJournal = 0;
     }
   }
   return rc == ESP_OK ? SQLITE_OK : SQLITE_IOERR_DELETE;
@@ -722,6 +807,7 @@ static int fsAccess(
   int* pResOut
 )
 {
+  sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)pVfs->pAppData;
   int isJournal = 0;
   int nName = (int) strlen(zPath);
 
@@ -736,8 +822,8 @@ static int fsAccess(
     isJournal = 1;
   }
 
-  if (shared_file.open && strncmp(shared_file.zName, zPath, nName) == 0) {
-    *pResOut = (!isJournal || shared_file.nJournal > 0);
+  if (p_vfs_data->open && strncmp(p_vfs_data->zName, zPath, nName) == 0) {
+    *pResOut = (!isJournal || p_vfs_data->nJournal > 0);
   } else {
     *pResOut = 0;
   }
@@ -835,8 +921,19 @@ static int fsCurrentTime(sqlite3_vfs* pVfs, double* pTimeOut)
 */
 int sqlite3_esp_sqlite_sdmmc_vfs_register(sdmmc_card_t *p_card, int make_default)
 {
-  if (pCard_global) return SQLITE_OK;
-  pCard_global = p_card;
+  if (fs_vfs.base.pAppData) {
+      sqlite3_free(fs_vfs.base.pAppData);
+  }
+
+  sdmmc_vfs_data *p_data = malloc(sizeof(sdmmc_vfs_data));
+  if(!p_data) {
+      fs_vfs.base.pAppData = NULL;
+      return SQLITE_NOMEM;
+  }
+  memset(p_data, 0, sizeof(sdmmc_vfs_data));
+  p_data->pCard = p_card;
+
+  fs_vfs.base.pAppData = p_data;
   fs_vfs.base.mxPathname = 256;
   fs_vfs.base.szOsFile = MAX(sizeof(tmp_file), sizeof(fs_file));
   return sqlite3_vfs_register(&fs_vfs.base, make_default);

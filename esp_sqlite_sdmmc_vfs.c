@@ -1,96 +1,25 @@
-/*
-** 2007 September 14
-**
-** The author disclaims copyright to this source code.  In place of
-** a legal notice, here is a blessing:
-**
-**    May you do good and not evil.
-**    May you find forgiveness for yourself and forgive others.
-**    May you share freely, never taking more than you give.
-**
-*************************************************************************
-**
-** OVERVIEW:
-**
-**   This file contains some example code demonstrating how the SQLite
-**   vfs feature can be used to have SQLite operate directly on an
-**   embedded media, without using an intermediate file system.
-**
-**   Because this is only a demo designed to run on a workstation, the
-**   underlying media is simulated using a regular file-system file. The
-**   size of the file is fixed when it is first created (default size 10 MB).
-**   From SQLite's point of view, this space is used to store a single
-**   database file and the journal file.
-**
-**   Any statement journal created is stored in volatile memory obtained
-**   from sqlite3_malloc(). Any attempt to create a temporary database file
-**   will fail (SQLITE_IOERR). To prevent SQLite from attempting this,
-**   it should be configured to store all temporary database files in
-**   main memory (see pragma "temp_store" or the SQLITE_TEMP_STORE compile
-**   time option).
-**
-** ASSUMPTIONS:
-**
-**   After it has been created, the blob file is accessed using the
-**   following three functions only:
-**
-**       mediaRead();            - Read a 512 byte block from the file.
-**       mediaWrite();           - Write a 512 byte block to the file.
-**       mediaSync();            - Tell the media hardware to sync.
-**
-**   It is assumed that these can be easily implemented by any "real"
-**   media vfs driver adapting this code.
-**
-** FILE FORMAT:
-**
-**   The basic principle is that the "database file" is stored at the
-**   beginning of the 10 MB blob and grows in a forward direction. The
-**   "journal file" is stored at the end of the 10MB blob and grows
-**   in the reverse direction. If, during a transaction, insufficient
-**   space is available to expand either the journal or database file,
-**   an SQLITE_FULL error is returned. The database file is never allowed
-**   to consume more than 90% of the blob space. If SQLite tries to
-**   create a file larger than this, SQLITE_FULL is returned.
-**
-**   No allowance is made for "wear-leveling", as is required by.
-**   embedded devices in the absence of equivalent hardware features.
-**
-**   The first 512 block byte of the file is reserved for storing the
-**   size of the "database file". It is updated as part of the sync()
-**   operation. On startup, it can only be trusted if no journal file
-**   exists. If a journal-file does exist, then it stores the real size
-**   of the database region. The second and subsequent blocks store the
-**   actual database content.
-**
-**   The size of the "journal file" is not stored persistently in the
-**   file. When the system is running, the size of the journal file is
-**   stored in volatile memory. When recovering from a crash, this vfs
-**   reports a very large size for the journal file. The normal journal
-**   header and checksum mechanisms serve to prevent SQLite from
-**   processing any data that lies past the logical end of the journal.
-**
-**   When SQLite calls OsDelete() to delete the journal file, the final
-**   512 bytes of the blob (the area containing the first journal header)
-**   are zeroed.
-**
-** LOCKING:
-**
-**   File locking is a no-op. Only one connection may be open at any one
-**   time using this demo vfs.
-*/
-
-#include <assert.h>
 #include <string.h>
 #include <sys/time.h>
 
-#include "esp_err.h"
-#include "esp_random.h"
-#include "sdmmc_cmd.h"
-#include "sqlite_port.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#include <sdkconfig.h>
+
+// Not sure why this is needed, but without these esp_log won't compile
+#ifdef ESP_STATIC_ASSERT
+#undef ESP_STATIC_ASSERT
+#endif
+#define ESP_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#include <esp_log.h>
+
+#include "esp_random.h"
+#include "sdmmc_cmd.h"
+
+#include "sqlite_port.h"
 #include "esp_sqlite_sdmmc_vfs.h"
 #include "sqlite3.h"
+
 #define TAG "sqlite_port"
 
 /*
@@ -288,8 +217,8 @@ static sqlite3_io_methods tmp_io_methods = {
 };
 
 /* Useful macros used in several places */
-#define MIN(x,y) ((x)<(y)?(x):(y))
-#define MAX(x,y) ((x)>(y)?(x):(y))
+#define FS_MIN(x,y) ((x)<(y)?(x):(y))
+#define FS_MAX(x,y) ((x)>(y)?(x):(y))
 
 
 /*
@@ -341,7 +270,7 @@ static int tmpWrite(
     pTmp->nAlloc = nNew;
   }
   memcpy(&pTmp->zAlloc[iOfst], zBuf, iAmt);
-  pTmp->nSize = (int) MAX(pTmp->nSize, iOfst+iAmt);
+  pTmp->nSize = (int) FS_MAX(pTmp->nSize, iOfst+iAmt);
   return SQLITE_OK;
 }
 
@@ -351,7 +280,7 @@ static int tmpWrite(
 static int tmpTruncate(sqlite3_file* pFile, sqlite3_int64 size)
 {
   tmp_file* pTmp = (tmp_file *) pFile;
-  pTmp->nSize = (int) MIN(pTmp->nSize, size);
+  pTmp->nSize = (int) FS_MIN(pTmp->nSize, size);
   return SQLITE_OK;
 }
 
@@ -456,7 +385,7 @@ static int fsRead(
   int64_t available_size;
   int64_t read_offset_on_disk;
 
-  printf("fsRead - iAmt %d, iOfst %lld \r\n", iAmt, iOfst);
+  ESP_LOGD(TAG, "fsRead - iAmt %d, iOfst %lld", iAmt, iOfst);
 
   if (p->eType == DATABASE_FILE) {
     available_size = p_vfs_data->nDatabase;
@@ -495,7 +424,12 @@ static int fsRead(
   if (is_aligned) {
     rc = sdmmc_read_sectors(p_vfs_data->pCard, zBuf, start_sector, num_sectors);
   } else {
+#ifdef CONFIG_SPIRAM
+    uint8_t* temp_buf = heap_caps_malloc(num_sectors * sector_size, MALLOC_CAP_SPIRAM);
+#else
     uint8_t* temp_buf = malloc(num_sectors * sector_size);
+#endif
+
     if (!temp_buf) {
       return SQLITE_NOMEM;
     }
@@ -508,10 +442,12 @@ static int fsRead(
   }
 
   if (rc != ESP_OK) {
+    ESP_LOGE(TAG, "fsRead - read fail: %d", rc);
     return SQLITE_IOERR_READ;
   }
 
   if (to_read < iAmt) {
+    ESP_LOGE(TAG, "fsRead - short read: %d %d", to_read, iAmt);
     return SQLITE_IOERR_SHORT_READ;
   }
 
@@ -533,7 +469,7 @@ static int fsWrite(
   esp_err_t rc = ESP_OK;
   int sector_size = p_vfs_data->pCard->csd.sector_size;
 
-  printf("fsWrite - iAmt %d, iOfst %lld \r\n", iAmt, iOfst);
+  ESP_LOGD(TAG, "fsWrite - iAmt %d, iOfst %lld ", iAmt, iOfst);
 
   int64_t start_byte_on_disk;
   if (p->eType == DATABASE_FILE) {
@@ -558,7 +494,12 @@ static int fsWrite(
   if (is_aligned) {
     rc = sdmmc_write_sectors(p_vfs_data->pCard, zBuf, start_sector, num_sectors);
   } else {
+#ifdef CONFIG_SPIRAM
+    uint8_t* temp_buf = heap_caps_malloc(num_sectors * sector_size, MALLOC_CAP_SPIRAM);
+#else
     uint8_t* temp_buf = malloc(num_sectors * sector_size);
+#endif
+
     if (!temp_buf) {
       return SQLITE_NOMEM;
     }
@@ -582,9 +523,9 @@ static int fsWrite(
   }
 
   if (p->eType == DATABASE_FILE) {
-    p_vfs_data->nDatabase = (int64_t) MAX(p_vfs_data->nDatabase, iAmt + iOfst);
+    p_vfs_data->nDatabase = (int64_t) FS_MAX(p_vfs_data->nDatabase, iAmt + iOfst);
   } else { // JOURNAL_FILE
-    p_vfs_data->nJournal = (int64_t) MAX(p_vfs_data->nJournal, iAmt + iOfst);
+    p_vfs_data->nJournal = (int64_t) FS_MAX(p_vfs_data->nJournal, iAmt + iOfst);
   }
 
   return SQLITE_OK;
@@ -598,9 +539,9 @@ static int fsTruncate(sqlite3_file* pFile, sqlite3_int64 size)
   fs_file* p = (fs_file *) pFile;
   sdmmc_vfs_data *p_vfs_data = (sdmmc_vfs_data *)p->pVfs->pAppData;
   if (p->eType == DATABASE_FILE) {
-    p_vfs_data->nDatabase = (int) MIN(p_vfs_data->nDatabase, size);
+    p_vfs_data->nDatabase = (int) FS_MIN(p_vfs_data->nDatabase, size);
   } else {
-    p_vfs_data->nJournal = (int) MIN(p_vfs_data->nJournal, size);
+    p_vfs_data->nJournal = (int) FS_MIN(p_vfs_data->nJournal, size);
   }
   return SQLITE_OK;
 }
@@ -735,18 +676,23 @@ static int fsOpen(
       uint8_t block0[BLOCKSIZE] = {0};
       rc = sdmmc_read_sectors(p_vfs_data->pCard, block0, 0, 1);
       if (rc != ESP_OK) {
-        printf( "Read blk0 fail\r\n");
+        ESP_LOGI(TAG, "Read blk0 fail");
         return SQLITE_IOERR_READ;
       }
       p_vfs_data->nDatabase = (block0[0] << 24) + (block0[1] << 16) + (block0[2] << 8) + block0[3];
 
+#ifdef CONFIG_SPIRAM
+      uint8_t* last_block = heap_caps_malloc(sector_size, MALLOC_CAP_SPIRAM);
+#else
       uint8_t* last_block = malloc(sector_size);
+#endif
+
       if (!last_block) {
           return SQLITE_NOMEM;
       }
       rc = sdmmc_read_sectors(p_vfs_data->pCard, last_block, (p_vfs_data->nBlob / sector_size) - 1, 1);
       if (rc != ESP_OK) {
-        printf("Read last blk fail, nblob=%llu \r\n", p_vfs_data->nBlob);
+        ESP_LOGE(TAG, "Read last blk fail, nblob=%llu", p_vfs_data->nBlob);
         free(last_block);
         return SQLITE_IOERR_READ;
       }
@@ -781,7 +727,6 @@ static int fsDelete(sqlite3_vfs* pVfs, const char* zPath, int dirSync)
   esp_err_t rc = ESP_OK;
   int nName = (int) strlen(zPath) - 8;
 
-  assert(strlen("-journal")==8);
   assert(strcmp("-journal", &zPath[nName])==0);
 
   if (p_vfs_data->open && strncmp(p_vfs_data->zName, zPath, nName) == 0) {
@@ -816,7 +761,6 @@ static int fsAccess(
     return SQLITE_OK;
   }
 
-  assert(strlen("-journal")==8);
   if (nName > 8 && strcmp("-journal", &zPath[nName - 8]) == 0) {
     nName -= 8;
     isJournal = 1;
@@ -935,7 +879,7 @@ int sqlite3_esp_sqlite_sdmmc_vfs_register(sdmmc_card_t *p_card, int make_default
 
   fs_vfs.base.pAppData = p_data;
   fs_vfs.base.mxPathname = 256;
-  fs_vfs.base.szOsFile = MAX(sizeof(tmp_file), sizeof(fs_file));
+  fs_vfs.base.szOsFile = FS_MAX(sizeof(tmp_file), sizeof(fs_file));
   return sqlite3_vfs_register(&fs_vfs.base, make_default);
 }
 
